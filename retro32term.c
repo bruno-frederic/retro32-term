@@ -5,7 +5,7 @@
  * hires screen, so whatever is on the other end of the serial line (the
  * Copperline browser bridge, --serial-connect, a null-modem cable) fills
  * the screen and the keyboard talks back. Earlier versions handed the
- * ANSI work to console.device; the console cannot express PC ANSI - SGR
+* ANSI work to console.device; the console cannot express PC ANSI - SGR
  * 1 is a brightness bit on a PC but a font weight to the console, and
  * the console addresses only pens 0-7, leaving the bright palette half
  * (the dark grey of shadows and dot leaders above all) unreachable on
@@ -33,12 +33,32 @@
  * intuition. Public domain (see LICENSE).
  *
  * Build: see build.sh (m68k-amigaos-gcc / bebbo toolchain).
+ *
+ * Build with VBCC:
+ *   vc +aos68k -o term retro32term.c
  */
 
+#ifdef __VBCC__
+#undef  ENABLE_SERIAL_ENGINE
+#undef  HIDE_POINTER
+#define NO_KIOSK
+/* NDK headers */
+#include <proto/exec.h>
+#include <proto/dos.h>
+#include <proto/graphics.h>
+#include <proto/intuition.h>
+#include <proto/console.h>
+#include <devices/conunit.h>
+#else
+#define ENABLE_SERIAL_ENGINE
+#define HIDE_POINTER
+#undef  NO_KIOSK
 /* Self-contained SDK slice (see the header for why): no NDK headers are
  * required beyond the toolchain's own <inline/macros.h>. */
 #include "amiga-mini.h"
+#endif
 
+#ifdef ENABLE_SERIAL_ENGINE
 /* The line settings: 8N1, 19200 everywhere. Paula buffers a single
  * received byte, so every byte must be serviced within one character
  * time (~520 us at 19200) -- a tight budget on a stock 68000, because
@@ -64,10 +84,16 @@
 
 static ULONG baud;
 static BOOL on_aros;
+#endif // ENABLE_SERIAL_ENGINE
 
 /* Opened in library mode (CONU_LIBRARY) purely for RawKeyConvert. */
+#ifdef AMIGA_MINI_H
 struct Library *ConsoleDevice;
+#else
+struct Device *ConsoleDevice;
+#endif
 
+#ifdef ENABLE_SERIAL_ENGINE
 /* Received-byte ring between the RBF interrupt handler and the main loop.
  * Power of two, and it must divide 65536: the indices are UWORDs because
  * a 68000 reads/writes a word atomically but a longword as two accesses,
@@ -90,9 +116,15 @@ static volatile UWORD rx_head, rx_tail;
  * turns it into a visible marker rather than silently corrupting the
  * session. */
 static volatile UBYTE rx_lost;
+#endif // ENABLE_SERIAL_ENGINE
 
+#ifdef AMIGA_MINI_H
 struct Library *IntuitionBase;
 struct Library *GfxBase;
+#else
+struct IntuitionBase *IntuitionBase;
+struct GfxBase *GfxBase;
+#endif
 
 /* libnix provides stdio over the shell console; declared by hand because
  * this build deliberately uses no libc headers. */
@@ -111,6 +143,7 @@ static const UWORD ansi_rgb4[16] = {
 static struct Screen *screen;
 static struct Window *window;
 
+#ifdef ENABLE_SERIAL_ENGINE
 static ULONG old_lvl5;
 static BOOL lvl5_taken;
 static BOOL dsksyn_was_enabled;
@@ -198,12 +231,19 @@ static void ser_putc(UBYTE c)
         ;
     CUSTOM_SERDAT = 0x0100 | c;
 }
+#endif // ENABLE_SERIAL_ENGINE
+
+static void term_feed(UBYTE b);
 
 static void ser_write(const UBYTE *data, LONG len)
 {
     LONG i;
     for (i = 0; i < len; i++)
+    #ifdef ENABLE_SERIAL_ENGINE
         ser_putc(data[i]);
+    #else
+        term_feed(data[i]); // Local echo; a real implementation should send data to TCP socket.
+    #endif
 }
 
 /* --- terminal engine ------------------------------------------------------
@@ -912,6 +952,7 @@ static int term_init(void)
 /* Debug aid: dump incoming bytes as hex instead of interpreting them. */
 #define DEBUG_HEX 0
 
+#ifdef ENABLE_SERIAL_ENGINE
 /* Interpret everything the interrupt handler has banked, bounded so a
  * long backlog cannot starve the keyboard poll (the kiosk loop calls
  * straight back in; the Kickstart loop re-drains before Wait). */
@@ -954,6 +995,12 @@ static void drain_serial(void)
     }
     cursor_show();
 }
+#else
+static void drain_serial(void)
+{
+    PutStr("--> drain_serial() : not implemented");
+}
+#endif // ENABLE_SERIAL_ENGINE
 
 /* Keystroke, translated: forward it down the line. RawKeyConvert emits
  * 8-bit CSI (0x9B) for special keys; BBSes expect the 7-bit ESC [ form,
@@ -981,8 +1028,13 @@ static void key_convert(UWORD code, UWORD qual)
     ie.ie_Code = code;
     ie.ie_Qualifier = qual;
     ie.ie_EventAddress = 0;
+#ifdef AMIGA_MINI_H
     ie.ie_Seconds = 0;
     ie.ie_Micros = 0;
+#else
+    ie.ie_TimeStamp.tv_secs = 0;
+    ie.ie_TimeStamp.tv_micro = 0;
+#endif
     n = RawKeyConvert(&ie, buf, (LONG)sizeof(buf), NULL);
     for (i = 0; i < n; i++)
         forward_key(buf[i]);
@@ -994,7 +1046,11 @@ static void key_convert(UWORD code, UWORD qual)
 static void handle_idcmp(void)
 {
     struct IntuiMessage *im;
+#ifdef AMIGA_MINI_H
     while ((im = (struct IntuiMessage *)GetMsg(WINDOW_USERPORT(window)))) {
+#else
+    while ((im = (struct IntuiMessage *)GetMsg(window->UserPort))) {
+#endif
         ULONG cls = im->Class;
         UWORD code = im->Code, qual = im->Qualifier;
         ReplyMsg(&im->ExecMessage);
@@ -1003,6 +1059,7 @@ static void handle_idcmp(void)
     }
 }
 
+#ifndef NO_KIOSK
 /* --- AROS Forbid() kiosk mode ---------------------------------------------
  * AROS's m68k interrupt-exit path (arch/m68k-all/kernel/kernel_intr.c,
  * core_ExitIntr) invokes the task scheduler only while task switching is
@@ -1121,6 +1178,7 @@ static void kiosk_loop(void)
         kbd_poll();
     }
 }
+#endif
 
 /* Pins the 8x8 Topaz everywhere it matters: the screen's own font (a
  * bare-floppy Kickstart boot can default to a wider Topaz; observed
@@ -1174,13 +1232,25 @@ static int setup(void)
 
     /* 33 is Kickstart 1.2's version; every V36-only call below branches
      * on the version actually present. */
+#ifdef AMIGA_MINI_H
     IntuitionBase = OpenLibrary("intuition.library", 33);
+#else
+    IntuitionBase = (struct IntuitionBase*) OpenLibrary("intuition.library", 33);
+#endif
     if (!IntuitionBase)
         return 1;
+#ifdef AMIGA_MINI_H
     GfxBase = OpenLibrary("graphics.library", 33);
+#else
+    GfxBase = (struct GfxBase*) OpenLibrary("graphics.library", 33);
+#endif
     if (!GfxBase)
         return 2;
+#ifdef AMIGA_MINI_H
     v36 = IntuitionBase->lib_Version >= 36;
+#else
+    v36 = IntuitionBase->LibNode.lib_Version >= 36;
+#endif
 
     /* Hand the ANSI palette to intuition itself with SA_Colors: OpenScreen
      * applies it as the last step of its own colour setup, which is the
@@ -1260,6 +1330,8 @@ static int setup(void)
         LoadRGB4(ViewPortAddress(window), ansi_rgb4, 16);
     }
 
+
+#ifdef HIDE_POINTER
     /* The kiosk takes no pointer input, so hide the Intuition pointer:
      * a blank 1-row sprite (chip RAM, zeroed) instead of the busy/arrow
      * imagery darting over the text whenever the host mouse moves.
@@ -1267,6 +1339,7 @@ static int setup(void)
     blank_pointer = AllocMem(BLANK_POINTER_BYTES, MEMF_CHIP | MEMF_CLEAR);
     if (blank_pointer)
         SetPointer(window, blank_pointer, 1, 16, 0, 0);
+#endif
 
     /* The engine's glyphs: the machine's own ROM Topaz 8. */
     tf = OpenFont(&topaz8);
@@ -1288,8 +1361,13 @@ static int setup(void)
                    (struct IORequest *)con_req, 0))
         return 8;
     con_open = TRUE;
+#ifdef AMIGA_MINI_H
     ConsoleDevice = (struct Library *)con_req->io_Device;
+#else
+    ConsoleDevice = con_req->io_Device;
+#endif
 
+#ifdef ENABLE_SERIAL_ENGINE
     /* Scrolls and fills are big blits; with BLTPRI (blitter-hog) set
      * they lock the CPU off the chip bus for milliseconds at a time,
      * which is longer than a character time and overruns Paula's
@@ -1328,12 +1406,14 @@ static int setup(void)
     CIAB_DDRA |= CIAF_COMDTR | CIAF_COMRTS;
     CIAB_PRA &= (UBYTE)~(CIAF_COMDTR | CIAF_COMRTS);
     dtr_asserted = TRUE;
+#endif // ENABLE_SERIAL_ENGINE
 
     return 0;
 }
 
 static void cleanup(void)
 {
+#ifdef ENABLE_SERIAL_ENGINE
     if (dtr_asserted) /* hang up: drop DTR/RTS so the far end sees us go */
         CIAB_PRA |= CIAF_COMDTR | CIAF_COMRTS;
     if (lvl5_taken) {
@@ -1343,26 +1423,39 @@ static void cleanup(void)
         if (dsksyn_was_enabled)
             CUSTOM_INTENA = INTF_SETCLR | INTF_DSKSYN;
     }
+#endif
+
     if (con_open)
         CloseDevice((struct IORequest *)con_req);
     /* The port and request are static; only the port's signal bit
      * was allocated. */
     if (con_port)
         FreeSignal(con_port->mp_SigBit);
+
+#ifdef HIDE_POINTER
     if (blank_pointer) {
         if (window)
             ClearPointer(window);
         FreeMem(blank_pointer, BLANK_POINTER_BYTES);
         blank_pointer = NULL;
     }
+#endif
+
     if (window)
         CloseWindow(window);
     if (screen)
         CloseScreen(screen);
+#ifdef AMIGA_MINI_H
     if (GfxBase)
         CloseLibrary(GfxBase);
     if (IntuitionBase)
         CloseLibrary(IntuitionBase);
+#else
+    if (GfxBase)
+        CloseLibrary((struct Library*) GfxBase);
+    if (IntuitionBase)
+        CloseLibrary((struct Library*) IntuitionBase);
+#endif
 }
 
 int main(void)
@@ -1383,7 +1476,8 @@ int main(void)
     }
 
     term_puts("\x1B[1;37mRetro32 Terminal\x1B[0m  ");
-    term_num(baud);
+#ifdef ENABLE_SERIAL_ENGINE
+    term_num("baud");
     /* DTR is up (setup raised it), so a bridge armed with a deferred
      * dial connects right about now and the far end's greeting simply
      * appears. Do not invite a blind Return: at a BBS login prompt an
@@ -1392,6 +1486,9 @@ int main(void)
     term_puts(" 8N1, ANSI 16-colour, Topaz\r\n"
               "Serial line ready - click Connect on the page if you have not already.\r\n"
               "\r\n");
+#else
+    term_puts("TCP-IP mode.");
+#endif
     cursor_show();
 
     /* On AROS take over the machine for good; see the kiosk_loop note.
