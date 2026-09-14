@@ -325,7 +325,13 @@ static void term_delete_chars(WORD n)
     term_rect_fill(COLS - n, cur_y, n, 1, term_pen_bg);
 }
 
-static void term_sgr(WORD v)
+/* https://syncterm.net/cterm.html#_csi_ps_m_select_graphic_rendition_sgr */
+#ifdef __SASC
+static void __inline
+#else
+static inline void
+#endif
+term_sgr(WORD v)
 {
     /* aixterm bright forms: brightness without the attribute dance. */
     if (v >= 90 && v <= 97) {
