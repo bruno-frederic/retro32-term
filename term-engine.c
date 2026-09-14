@@ -167,12 +167,13 @@ static void term_glyph(WORD x, UBYTE ch)
     UBYTE fg = term_pen_fg, bg = term_pen_bg;
     WORD bpr = term_bpr;    /* Keep term_bpr in a register for 32 writes. */
     WORD p, r;
-
+    UBYTE **plane = term_plane;
     term_blit_sync();
+
     for (p = 0; p < 4; p++) {
         UBYTE f = (UBYTE)((fg >> p) & 1);
         UBYTE b = (UBYTE)((bg >> p) & 1);
-        UBYTE *dst = term_plane[p] + off;
+        UBYTE *dst = *plane++ + off;
 
         /* A plane is either constant, the glyph, or its inverse.  This
          * avoids two masks and three byte operations for every pixel row.
@@ -198,7 +199,7 @@ static void term_glyph(WORD x, UBYTE ch)
             g -= 8;
         }
         if (atr_under)
-            *(term_plane[p] + off + 7 * term_bpr) = f ? 0xFF : 0x00;
+            *(dst - bpr) = f ? 0xFF : 0x00;
     }
 }
 
