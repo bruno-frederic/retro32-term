@@ -152,16 +152,35 @@ static void term_glyph(WORD x, WORD y, UBYTE ch)
 
     term_blit_sync();
     for (p = 0; p < 4; p++) {
-        UBYTE fm = (UBYTE)((fg & (1 << p)) ? 0xFF : 0x00);
-        UBYTE bm = (UBYTE)((bg & (1 << p)) ? 0xFF : 0x00);
+        UBYTE f = (UBYTE)((fg >> p) & 1);
+        UBYTE b = (UBYTE)((bg >> p) & 1);
         UBYTE *dst = term_plane[p] + off;
-        for (r = 0; r < 8; r++) {
-            UBYTE bits = g[r];
-            if (r == 7 && atr_under)
-                bits = 0xFF;
-            *dst = (UBYTE)((bits & fm) | (~bits & bm));
-            dst += term_bpr;
+
+        /* A plane is either constant, the glyph, or its inverse.  This
+         * avoids two masks and three byte operations for every pixel row.
+         * It matters for ANSI art, where SGR changes far less often than
+         * printable characters. */
+        if (f == b) {
+            UBYTE v = f ? 0xFF : 0x00;
+            for (r = 0; r < 8; r++) {
+                *dst = v;
+                dst += term_bpr;
+            }
+        } else if (f) {
+            for (r = 0; r < 8; r++) {
+                *dst = *g++;
+                dst += term_bpr;
+            }
+            g -= 8;
+        } else {
+            for (r = 0; r < 8; r++) {
+                *dst = (UBYTE)~*g++;
+                dst += term_bpr;
+            }
+            g -= 8;
         }
+        if (atr_under)
+            *(term_plane[p] + off + 7 * term_bpr) = f ? 0xFF : 0x00;
     }
 }
 
