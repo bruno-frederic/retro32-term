@@ -573,9 +573,13 @@ static void term_csi(UBYTE final)
 
 static void term_csi_begin(void)
 {
-    WORD i;
-    for (i = 0; i < P_MAX; i++)
-        p_params[i] = 0;
+    /* Parameters are initialized lazily instead of clearing all P_MAX slots
+     * at ESC[ time.
+     * Resetting all sixteen slots here made every CSI introducer write
+     * 32 bytes, although BBS output normally has one or two parameters.
+     * term_feed() initializes each subsequent p_params[] entry when it
+     * encounters a semicolon. */
+    p_params[0] = 0;
     p_np = 0;
     p_have = 0;
     p_priv = 0;
@@ -630,8 +634,13 @@ term_feed(UBYTE b)
                 p_params[p_np] = v * 10 + (b - '0');
             p_have = 1;
         } else if (b == ';') {
-            if (p_np < P_MAX - 1)
+            if (p_np < P_MAX - 1) {
                 p_np++;
+                /* Initialize the newly selected parameter lazily.
+                 * This also makes empty parameters (for example ESC[;31m)
+                 * read as zero. */
+                p_params[p_np] = 0;
+            }
             p_have = 1;
         } else if (b == '?' && !p_have && !p_priv) {
             p_priv = b;
