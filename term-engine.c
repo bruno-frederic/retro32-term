@@ -55,6 +55,7 @@ static WORD sav_x, sav_y; /* CSI s/u (and ESC 7/8) cursor save slot */
 static WORD atr_fg = 7;   /* base colours 0-7; brightness lives in */
 static WORD atr_bg;       /* atr_bold / atr_blink */
 static WORD atr_bold, atr_blink, atr_inv, atr_under;
+static UBYTE term_pen_fg = 7, term_pen_bg; /* Cached resolved pens */
 static WORD wrap_pending;
 static WORD cursor_visible = 1; /* ESC[?25l/h */
 static WORD cursor_drawn;       /* cursor cell is currently inverted */
@@ -129,25 +130,21 @@ static void term_rect_copy(WORD sx, WORD sy, WORD dx, WORD dy, WORD w, WORD h)
     blit_pending = 1;
 }
 
-static WORD term_fg_pen(void)
+/* Resolve the current SGR attributes to foreground and background pens. */
+static void term_update_pens(void)
 {
     WORD fg = atr_fg + (atr_bold ? 8 : 0);
     WORD bg = atr_bg + (atr_blink ? 8 : 0);
-    return atr_inv ? bg : fg;
-}
 
-static WORD term_bg_pen(void)
-{
-    WORD fg = atr_fg + (atr_bold ? 8 : 0);
-    WORD bg = atr_bg + (atr_blink ? 8 : 0);
-    return atr_inv ? fg : bg;
+    term_pen_fg = (UBYTE)(atr_inv ? bg : fg);
+    term_pen_bg = (UBYTE)(atr_inv ? fg : bg);
 }
 
 static void term_glyph(WORD x, WORD y, UBYTE ch)
 {
     const UBYTE *g = &font8[(UWORD)ch << 3];
     LONG off = (LONG)y * (term_bpr << 3) + x;
-    WORD fg = term_fg_pen(), bg = term_bg_pen();
+    UBYTE fg = term_pen_fg, bg = term_pen_bg;
     WORD p, r;
 
     term_blit_sync();
@@ -221,7 +218,7 @@ static void cursor_show(void)
 
 static void term_scroll_up(WORD n)
 {
-    WORD bg = term_bg_pen();
+    WORD bg = term_pen_bg;
     if (n >= term_rows) {
         term_rect_fill(0, 0, COLS, term_rows, bg);
         return;
@@ -232,7 +229,7 @@ static void term_scroll_up(WORD n)
 
 static void term_scroll_down(WORD n)
 {
-    WORD bg = term_bg_pen();
+    WORD bg = term_pen_bg;
     if (n >= term_rows) {
         term_rect_fill(0, 0, COLS, term_rows, bg);
         return;
@@ -243,7 +240,7 @@ static void term_scroll_down(WORD n)
 
 static void term_erase_display(WORD mode)
 {
-    WORD bg = term_bg_pen();
+    WORD bg = term_pen_bg;
     if (mode >= 2) {
         /* ANSI.SYS semantics: 2J (and xterm's 3J) clears and homes. */
         term_rect_fill(0, 0, COLS, term_rows, bg);
@@ -260,7 +257,7 @@ static void term_erase_display(WORD mode)
 
 static void term_erase_line(WORD mode)
 {
-    WORD bg = term_bg_pen();
+    WORD bg = term_pen_bg;
     if (mode >= 2)
         term_rect_fill(0, cur_y, COLS, 1, bg);
     else if (mode == 1)
@@ -275,7 +272,7 @@ static void term_insert_lines(WORD n)
     if (n > below)
         n = below;
     term_rect_copy(0, cur_y, 0, cur_y + n, COLS, below - n);
-    term_rect_fill(0, cur_y, COLS, n, term_bg_pen());
+    term_rect_fill(0, cur_y, COLS, n, term_pen_bg);
 }
 
 static void term_delete_lines(WORD n)
@@ -284,7 +281,7 @@ static void term_delete_lines(WORD n)
     if (n > below)
         n = below;
     term_rect_copy(0, cur_y + n, 0, cur_y, COLS, below - n);
-    term_rect_fill(0, term_rows - n, COLS, n, term_bg_pen());
+    term_rect_fill(0, term_rows - n, COLS, n, term_pen_bg);
 }
 
 static void term_insert_chars(WORD n)
@@ -293,7 +290,7 @@ static void term_insert_chars(WORD n)
     if (n > rest)
         n = rest;
     term_rect_copy(cur_x, cur_y, cur_x + n, cur_y, rest - n, 1);
-    term_rect_fill(cur_x, cur_y, n, 1, term_bg_pen());
+    term_rect_fill(cur_x, cur_y, n, 1, term_pen_bg);
 }
 
 static void term_delete_chars(WORD n)
@@ -302,7 +299,7 @@ static void term_delete_chars(WORD n)
     if (n > rest)
         n = rest;
     term_rect_copy(cur_x + n, cur_y, cur_x, cur_y, rest - n, 1);
-    term_rect_fill(COLS - n, cur_y, n, 1, term_bg_pen());
+    term_rect_fill(COLS - n, cur_y, n, 1, term_pen_bg);
 }
 
 static void term_sgr(WORD v)
@@ -395,7 +392,7 @@ static void term_ctl(UBYTE b)
         term_linefeed();
         break;
     case 0x0C: /* FF: clear and home, as on the console it replaces */
-        term_rect_fill(0, 0, COLS, term_rows, term_bg_pen());
+        term_rect_fill(0, 0, COLS, term_rows, term_pen_bg);
         cur_x = cur_y = 0;
         wrap_pending = 0;
         break;
@@ -571,6 +568,8 @@ static void term_csi(UBYTE final)
             }
             term_sgr(v);
         }
+        /* Resolve fore/background pens only when SGR attributes change */
+        term_update_pens();
         break;
     case 's':
         sav_x = cur_x;
@@ -723,6 +722,7 @@ static void term_num(ULONG v)
 static void term_reset(void)
 {
     term_sgr(0);
+    term_update_pens();
     cur_x = cur_y = sav_x = sav_y = 0;
     wrap_pending = 0;
     cursor_visible = 1;
