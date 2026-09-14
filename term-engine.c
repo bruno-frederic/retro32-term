@@ -52,6 +52,8 @@ static UBYTE font8[256 * 8];
 
 static WORD cur_x, cur_y;
 static WORD sav_x, sav_y; /* CSI s/u (and ESC 7/8) cursor save slot */
+static LONG term_row_stride;  /* bytes per character row (term_bpr * 8), computed once */
+static LONG term_row_base;    /* cur_y * term_row_stride, kept in sync by term_sync_row_base() */
 static WORD atr_fg = 7;   /* base colours 0-7; brightness lives in */
 static WORD atr_bg;       /* atr_bold / atr_blink */
 static WORD atr_bold, atr_blink, atr_inv, atr_under;
@@ -140,10 +142,28 @@ static void term_update_pens(void)
     term_pen_bg = (UBYTE)(atr_inv ? fg : bg);
 }
 
-static void term_glyph(WORD x, WORD y, UBYTE ch)
+ /* Update the cached row offset based on cur_y.
+ *
+ * This is called only when cur_y changes (roughly once per line),
+ * instead of from the per‑glyph rendering path. Doing the multiply
+ * here means we pay the cost once per line rather than once per
+ * character drawn on that line.
+ */
+static void term_sync_row_base(void)
+{
+    term_row_base = (LONG)cur_y * term_row_stride;
+}
+
+/* Draws the glyph at column x, on the current row.
+
+ * The row isn't a parameter: it's read from term_row_base, kept in sync
+ * with cur_y by term_sync_row_base(), so callers never need to pass it
+ * (and term_glyph() never needs to multiply for it).
+ * Only caller: term_printable(), with x == cur_x. */
+static void term_glyph(WORD x, UBYTE ch)
 {
     const UBYTE *g = &font8[(UWORD)ch << 3];
-    LONG off = (LONG)y * (term_bpr << 3) + x;
+    LONG off = term_row_base + x;
     UBYTE fg = term_pen_fg, bg = term_pen_bg;
     WORD p, r;
 
@@ -187,7 +207,7 @@ static void term_glyph(WORD x, WORD y, UBYTE ch)
  * so glyphs never land on an inverted cell. */
 static void term_cursor_flip(void)
 {
-    LONG off = (LONG)cur_y * (term_bpr << 3) + cur_x;
+    LONG off = term_row_base + cur_x;
     WORD p, r;
 
     term_blit_sync();
@@ -246,6 +266,7 @@ static void term_erase_display(WORD mode)
         term_rect_fill(0, 0, COLS, term_rows, bg);
         cur_x = cur_y = 0;
         wrap_pending = 0;
+        term_sync_row_base();
     } else if (mode == 1) {
         term_rect_fill(0, 0, COLS, cur_y, bg);
         term_rect_fill(0, cur_y, cur_x + 1, 1, bg);
@@ -371,6 +392,7 @@ static void term_linefeed(void)
     } else {
         cur_y++;
     }
+    term_sync_row_base();
 }
 
 static void term_ctl(UBYTE b)
@@ -395,6 +417,7 @@ static void term_ctl(UBYTE b)
         term_rect_fill(0, 0, COLS, term_rows, term_pen_bg);
         cur_x = cur_y = 0;
         wrap_pending = 0;
+        term_sync_row_base();
         break;
     case 0x0D:
         cur_x = 0;
@@ -412,7 +435,7 @@ static void term_printable(UBYTE ch)
         cur_x = 0;
         term_linefeed();
     }
-    term_glyph(cur_x, cur_y, ch);
+    term_glyph(cur_x, ch);
     if (cur_x >= COLS - 1)
         wrap_pending = 1;
     else
@@ -471,6 +494,7 @@ static void term_moved(void)
     if (cur_y > term_rows - 1)
         cur_y = term_rows - 1;
     wrap_pending = 0;
+    term_sync_row_base();
 }
 
 static void term_reset(void);
@@ -727,6 +751,7 @@ static void term_reset(void)
     wrap_pending = 0;
     cursor_visible = 1;
     cursor_drawn = 0;
+    term_sync_row_base();
     term_rect_fill(0, 0, COLS, term_rows, 0);
 }
 
@@ -755,6 +780,9 @@ static int term_init(struct Screen *screen, struct TextFont *tf)
             return 1;
     }
     term_bpr = (WORD)term_bm->BytesPerRow;
+    /* Fixed for the life of the screen, so computed once here instead
+     * of on every glyph. */
+    term_row_stride = (LONG)term_bpr << 3;
     term_rows = screen->Height >> 3;
     term_reset();
     return 0;
