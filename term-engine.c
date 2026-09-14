@@ -165,6 +165,7 @@ static void term_glyph(WORD x, UBYTE ch)
     const UBYTE *g = &font8[(UWORD)ch << 3];
     LONG off = term_row_base + x;
     UBYTE fg = term_pen_fg, bg = term_pen_bg;
+    WORD bpr = term_bpr;    /* Keep term_bpr in a register for 32 writes. */
     WORD p, r;
 
     term_blit_sync();
@@ -181,18 +182,18 @@ static void term_glyph(WORD x, UBYTE ch)
             UBYTE v = f ? 0xFF : 0x00;
             for (r = 0; r < 8; r++) {
                 *dst = v;
-                dst += term_bpr;
+                dst += bpr;
             }
         } else if (f) {
             for (r = 0; r < 8; r++) {
                 *dst = *g++;
-                dst += term_bpr;
+                dst += bpr;
             }
             g -= 8;
         } else {
             for (r = 0; r < 8; r++) {
                 *dst = (UBYTE)~*g++;
-                dst += term_bpr;
+                dst += bpr;
             }
             g -= 8;
         }
