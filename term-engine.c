@@ -439,7 +439,7 @@ static void term_dsr(WORD which)
 
 static WORD pn1(WORD i)
 {
-    return p_params[i] ? p_params[i] : 1;
+    return (WORD) (p_params[i] ? p_params[i] : 1);
 }
 
 /* Shared tail for every cursor motion: absolute and relative moves both
