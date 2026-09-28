@@ -9,9 +9,10 @@
  * used at all: incoming bytes run through a small ECMA-48 state machine
  * here and are drawn straight into the screen's 4 bitplanes.
  *
- * - A character cell is 8x8 pixels, and 8 hires pixels are exactly one
- *   byte per bitplane, so a glyph is 32 byte writes with foreground and
- *   background masks; no blitter, no read-modify-write.
+ * - A character cell is 8 pixels high and as wide as the font: 8 hires
+ *   pixels are exactly one byte per bitplane (the C64 font's 16, two), so
+ *   a glyph is 32 (64) byte writes with foreground and background masks;
+ *   no blitter, no read-modify-write.
  * - Glyphs come from the ROM Topaz 8 (see font_extract), so the art
  *   renders in the face it was drawn for on every Kickstart and AROS.
  * - Scrolls, erases and insert/delete go through BltBitMap on the
@@ -31,16 +32,17 @@
  *   ANSI order, bold folds into bright foregrounds, blink into bright
  *   backgrounds (iCE colours), erases fill with the current background
  *   (BCE), ESC[2J homes the cursor like ANSI.SYS, autowrap is deferred
- *   DEC-style (a glyph in column 80 parks the cursor there and the
+ *   DEC-style (a glyph in the last column parks the cursor there and the
  *   next glyph wraps), and DSR 6 is answered,
  *   on Kickstart and AROS alike.
  *
  * Runs on Kickstart 1.3 as well as 2.0+ and the AROS ROM Copperline
  * bundles. Public domain (see LICENSE).
  *
- * Prerequisites required by this module for term_init():
+ * Prerequisites required by this module for term_init() and
+ * term_init_area():
  * - Screen   : must already be opened
- * - TextFont : must already be opened; should be 8x8
+ * - TextFont : must already be opened; 8 pixels high, 8 to 16 wide
  * Additional requirements:
  * - Caller must include the necessary NDK headers before including this
  *   module.
@@ -53,7 +55,7 @@
 static struct BitMap *term_bm; /* the screen's bitmap */
 static UBYTE *term_plane[4];
 static WORD term_bpr;  /* bytes per plane row (80 at 640 wide) */
-static WORD term_rows; /* text rows: 32 PAL, 25 NTSC */
+static WORD term_rows; /* text rows: the area's height / 8 */
 
 /* Topaz 8 glyphs, one byte per row, flat for fast cell addressing. */
 static UBYTE font8[256 * 8];
@@ -78,7 +80,7 @@ static WORD cursor_drawn;       /* cursor cell is currently inverted */
 static WORD blit_pending;       /* a BltBitMap has been started */
 
 /* The terminal's place in the screen bitmap: top-left pixel (term_x0 a
- * multiple of 8 for direct drawing), 80 columns by term_rows rows. */
+ * multiple of 8 for direct drawing), term_cols columns by term_rows rows. */
 static WORD term_x0, term_y0;
 
 /* Drawing through a RastPort (see the header comment): term_rp is the
@@ -988,8 +990,8 @@ static void term_set_font(struct TextFont *tf)
         SetFont(term_win_rp, tf);
 }
 
-/* The terminal in the rectangle x0, y0, w x h of screen's bitmap, 80
- * columns of 8x8 cells in font tf. rp is the RastPort of the window it
+/* The terminal in the rectangle x0, y0, w x h of screen's bitmap: as many
+ * columns of font tf's cells as fit, at most COLS, h / 8 rows. rp is the RastPort of the window it
  * lies in, whose (0, 0) is pixel (rpdx, rpdy) of the bitmap, for drawing
  * while something covers it and on a bitmap that is not planar; NULL:
  * direct drawing only. 0 when the terminal can be drawn. */
