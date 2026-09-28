@@ -82,6 +82,7 @@ static struct RastPort *term_rp;
 static struct RastPort *term_win_rp;  /* the window's; NULL: direct only */
 static WORD term_rp_dx, term_rp_dy;
 static WORD term_direct_ok;           /* planar, 4+ planes, byte-aligned area */
+static WORD term_pens_ansi = 1;       /* pens 0-15 are the ANSI colours (direct drawing needs it) */
 static WORD term_baseline;            /* the font's, for Move() before Text() */
 static UBYTE term_pen_map[16];        /* ANSI colour -> screen pen (RastPort path) */
 
@@ -200,18 +201,20 @@ static void term_rect_scroll(WORD x, WORD y, WORD w, WORD h, WORD dx, WORD dy, W
         return;
     }
     if (term_rp) {
+        /* The uncovered strip is filled below: ScrollRaster() leaves it to a
+         * backfill hook, when the window has one, instead of BgPen (V39). */
         term_run_flush();
         SetBPen(term_rp, term_pen_map[pen & 0xF]);
         ScrollRaster(term_rp, -dx << 3, -dy << 3,
                      TERM_PX(x), TERM_PY(y), TERM_PX(x + w) - 1, TERM_PY(y + h) - 1);
         blit_pending = 1;
-        return;
+    } else {
+        /* copy what stays, then fill what the move uncovered */
+        BltBitMap(term_bm, term_x0 + ((x + (dx < 0 ? adx : 0)) << 3), term_y0 + ((y + (dy < 0 ? ady : 0)) << 3),
+                  term_bm, term_x0 + ((x + (dx > 0 ? adx : 0)) << 3), term_y0 + ((y + (dy > 0 ? ady : 0)) << 3),
+                  (w - adx) << 3, (h - ady) << 3, 0xC0, 0xF, NULL);
+        blit_pending = 1;
     }
-    /* copy what stays, then fill what the move uncovered */
-    BltBitMap(term_bm, term_x0 + ((x + (dx < 0 ? adx : 0)) << 3), term_y0 + ((y + (dy < 0 ? ady : 0)) << 3),
-              term_bm, term_x0 + ((x + (dx > 0 ? adx : 0)) << 3), term_y0 + ((y + (dy > 0 ? ady : 0)) << 3),
-              (w - adx) << 3, (h - ady) << 3, 0xC0, 0xF, NULL);
-    blit_pending = 1;
     if (dy > 0)
         term_rect_fill(x, y, w, ady, pen);
     else if (dy < 0)
@@ -879,7 +882,7 @@ static void term_flush(void)
  * the engine cannot draw into directly always takes the RastPort. */
 static void term_covered(WORD covered)
 {
-    struct RastPort *want = (covered || !term_direct_ok) ? term_win_rp : NULL;
+    struct RastPort *want = (covered || !term_direct_ok || !term_pens_ansi) ? term_win_rp : NULL;
 
     if (want == term_rp)
         return;
@@ -888,13 +891,23 @@ static void term_covered(WORD covered)
     blit_pending = 1;       /* the RastPort's blits may still run */
 }
 
-/* The pens the 16 ANSI colours are on, for the RastPort path (a planar
- * screen of the engine's own has them on pens 0-15, the default). */
+/* The pens the 16 ANSI colours are on (NULL: pens 0-15, a screen of the
+ * engine's own). Other pens are drawn only through the RastPort: direct
+ * drawing writes the colour number into the planes. */
 static void term_set_pens(const UBYTE *pens)
 {
     WORD i;
-    for (i = 0; i < 16; i++)
+
+    term_pens_ansi = 1;
+    for (i = 0; i < 16; i++) {
         term_pen_map[i] = pens ? pens[i] : (UBYTE)i;
+        if (term_pen_map[i] != i)
+            term_pens_ansi = 0;
+    }
+    if (!term_pens_ansi && term_win_rp && !term_rp) {
+        term_rp = term_win_rp;
+        blit_pending = 1;
+    }
 }
 
 /* The terminal in the rectangle x0, y0, w x h of screen's bitmap, 80
@@ -916,7 +929,10 @@ static int term_init_area(struct Screen *screen, struct RastPort *rp, WORD rpdx,
     /* RastPort.BitMap is the authoritative bitmap on every OS (the
      * embedded Screen.BitMap is a compatibility copy on V39+/AROS). */
     term_bm = screen->RastPort.BitMap;
-    term_direct_ok = term_bm->Depth >= 4 && (x0 & 7) == 0 && w >= COLS * 8;
+    /* Exactly 4 planes: the direct path writes planes 0-3 only, so on a
+     * deeper screen the upper planes' bits (a window's backfill) would
+     * show through as other colours. */
+    term_direct_ok = term_bm->Depth == 4 && (x0 & 7) == 0 && w >= COLS * 8;
     if (((struct Library *)GfxBase)->lib_Version >= 39
         && !(GetBitMapAttr(term_bm, BMA_FLAGS) & BMF_STANDARD))
         term_direct_ok = 0;             /* RTG: not bitplanes */
