@@ -19,6 +19,14 @@
  *   pen, and BltBitMap picks the descending mode by itself when the
  *   rectangles overlap. The one rule is WaitBlit before the next CPU
  *   write into the planes (term_blit_sync).
+ * - Drawing straight into the bitmap is only right while nothing lies
+ *   over the terminal: another window, a requester, an open menu owns
+ *   those pixels, and the terminal must neither draw over them nor
+ *   scroll them along. Then (term_covered), and on a bitmap that is not
+ *   planar (RTG), the same operations go through the terminal window's
+ *   RastPort instead: Text() in runs, RectFill(), ScrollRaster() and a
+ *   COMPLEMENT fill for the cursor. Its layer keeps what is covered
+ *   (smart refresh) and gives it back when the window over it goes.
  * - PC semantics throughout: the palette is the 16-colour CGA set in
  *   ANSI order, bold folds into bright foregrounds, blink into bright
  *   backgrounds (iCE colours), erases fill with the current background
@@ -63,6 +71,25 @@ static WORD cursor_visible = 1; /* ESC[?25l/h */
 static WORD cursor_drawn;       /* cursor cell is currently inverted */
 static WORD blit_pending;       /* a BltBitMap has been started */
 
+/* The terminal's place in the screen bitmap: top-left pixel (term_x0 a
+ * multiple of 8 for direct drawing), 80 columns by term_rows rows. */
+static WORD term_x0, term_y0;
+
+/* Drawing through a RastPort (see the header comment): term_rp is the
+ * window's RastPort while it is in use, NULL while drawing directly. A
+ * pixel (x, y) of the bitmap is (x - term_rp_dx, y - term_rp_dy) in it. */
+static struct RastPort *term_rp;
+static struct RastPort *term_win_rp;  /* the window's; NULL: direct only */
+static WORD term_rp_dx, term_rp_dy;
+static WORD term_direct_ok;           /* planar, 4+ planes, byte-aligned area */
+static WORD term_baseline;            /* the font's, for Move() before Text() */
+static UBYTE term_pen_map[16];        /* ANSI colour -> screen pen (RastPort path) */
+
+/* Glyphs waiting for one Text() call: same row, adjacent, same pens. */
+static UBYTE term_run[COLS];
+static WORD term_run_n, term_run_x, term_run_y;
+static UBYTE term_run_fg, term_run_bg, term_run_ul;
+
 /* CSI parser state. */
 #define P_MAX 16
 static WORD p_state; /* 0 plain, 1 ESC, 2 ESC intermediates, 3 CSI body */
@@ -98,6 +125,30 @@ static void font_extract(struct TextFont *tf)
     }
 }
 
+#define TERM_PX(x) ((WORD)(term_x0 + ((x) << 3) - term_rp_dx))
+#define TERM_PY(y) ((WORD)(term_y0 + ((y) << 3) - term_rp_dy))
+
+/* Draw the waiting glyphs (RastPort path). */
+static void term_run_flush(void)
+{
+    struct RastPort *rp = term_rp;
+    WORD x, y;
+
+    if (!term_run_n)
+        return;
+    x = TERM_PX(term_run_x);
+    y = TERM_PY(term_run_y);
+    SetAPen(rp, term_pen_map[term_run_fg]);
+    SetBPen(rp, term_pen_map[term_run_bg]);
+    SetDrMd(rp, JAM2);
+    Move(rp, x, y + term_baseline);
+    Text(rp, (STRPTR)term_run, term_run_n);
+    if (term_run_ul)
+        RectFill(rp, x, y + 7, x + (term_run_n << 3) - 1, y + 7);
+    term_run_n = 0;
+    blit_pending = 1;
+}
+
 static void term_blit_sync(void)
 {
     if (blit_pending) {
@@ -112,24 +163,63 @@ static void term_blit_sync(void)
 static void term_rect_fill(WORD x, WORD y, WORD w, WORD h, WORD pen)
 {
     ULONG setm = (ULONG)pen & 0xF;
+    WORD px, py;
     if (w <= 0 || h <= 0)
         return;
+    if (term_rp) {
+        term_run_flush();
+        SetAPen(term_rp, term_pen_map[pen & 0xF]);
+        SetDrMd(term_rp, JAM1);
+        RectFill(term_rp, TERM_PX(x), TERM_PY(y), TERM_PX(x + w) - 1, TERM_PY(y + h) - 1);
+        blit_pending = 1;
+        return;
+    }
+    px = term_x0 + (x << 3);
+    py = term_y0 + (y << 3);
     if (setm)
-        BltBitMap(term_bm, x << 3, y << 3, term_bm, x << 3, y << 3,
+        BltBitMap(term_bm, px, py, term_bm, px, py,
                   w << 3, h << 3, 0xFF, setm, NULL);
     if (setm != 0xF)
-        BltBitMap(term_bm, x << 3, y << 3, term_bm, x << 3, y << 3,
+        BltBitMap(term_bm, px, py, term_bm, px, py,
                   w << 3, h << 3, 0x00, setm ^ 0xF, NULL);
     blit_pending = 1;
 }
 
-static void term_rect_copy(WORD sx, WORD sy, WORD dx, WORD dy, WORD w, WORD h)
+/* Move the cells of the rectangle x, y, w, h by (dx, dy) cells -- the
+ * cells moved out fall off its edge, the ones uncovered are filled with
+ * pen. On the RastPort path one ScrollRaster(), which moves what other
+ * windows cover too. */
+static void term_rect_scroll(WORD x, WORD y, WORD w, WORD h, WORD dx, WORD dy, WORD pen)
 {
+    WORD adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+
     if (w <= 0 || h <= 0)
         return;
-    BltBitMap(term_bm, sx << 3, sy << 3, term_bm, dx << 3, dy << 3,
-              w << 3, h << 3, 0xC0, 0xF, NULL);
+    if (adx >= w || ady >= h) {
+        term_rect_fill(x, y, w, h, pen);
+        return;
+    }
+    if (term_rp) {
+        term_run_flush();
+        SetBPen(term_rp, term_pen_map[pen & 0xF]);
+        ScrollRaster(term_rp, -dx << 3, -dy << 3,
+                     TERM_PX(x), TERM_PY(y), TERM_PX(x + w) - 1, TERM_PY(y + h) - 1);
+        blit_pending = 1;
+        return;
+    }
+    /* copy what stays, then fill what the move uncovered */
+    BltBitMap(term_bm, term_x0 + ((x + (dx < 0 ? adx : 0)) << 3), term_y0 + ((y + (dy < 0 ? ady : 0)) << 3),
+              term_bm, term_x0 + ((x + (dx > 0 ? adx : 0)) << 3), term_y0 + ((y + (dy > 0 ? ady : 0)) << 3),
+              (w - adx) << 3, (h - ady) << 3, 0xC0, 0xF, NULL);
     blit_pending = 1;
+    if (dy > 0)
+        term_rect_fill(x, y, w, ady, pen);
+    else if (dy < 0)
+        term_rect_fill(x, y + h - ady, w, ady, pen);
+    if (dx > 0)
+        term_rect_fill(x, y, adx, h, pen);
+    else if (dx < 0)
+        term_rect_fill(x + w - adx, y, adx, h, pen);
 }
 
 /* Resolve the current SGR attributes to foreground and background pens. */
@@ -151,7 +241,7 @@ static void term_update_pens(void)
  */
 static void term_sync_row_base(void)
 {
-    term_row_base = (LONG)cur_y * term_row_stride;
+    term_row_base = (LONG)cur_y * term_row_stride + (LONG)term_y0 * term_bpr + (term_x0 >> 3);
 }
 
 /* Draws the glyph at column x, on the current row.
@@ -168,6 +258,21 @@ static void term_glyph(WORD x, UBYTE ch)
     WORD bpr = term_bpr;    /* Keep term_bpr in a register for 32 writes. */
     WORD p, r;
     UBYTE **plane = term_plane;
+
+    if (term_rp) {          /* collect a run for one Text() */
+        if (term_run_n && (x != term_run_x + term_run_n || cur_y != term_run_y
+                           || fg != term_run_fg || bg != term_run_bg || atr_under != term_run_ul))
+            term_run_flush();
+        if (!term_run_n) {
+            term_run_x = x;
+            term_run_y = cur_y;
+            term_run_fg = fg;
+            term_run_bg = bg;
+            term_run_ul = (UBYTE)atr_under;
+        }
+        term_run[term_run_n++] = ch;
+        return;
+    }
     term_blit_sync();
 
     for (p = 0; p < 4; p++) {
@@ -212,6 +317,17 @@ static void term_cursor_flip(void)
     LONG off = term_row_base + cur_x;
     WORD p, r;
 
+    if (term_rp) {          /* pen XOR 15, as below */
+        UBYTE mask = term_rp->Mask;
+        term_run_flush();
+        SetDrMd(term_rp, COMPLEMENT);
+        term_rp->Mask = 0x0F;
+        RectFill(term_rp, TERM_PX(cur_x), TERM_PY(cur_y), TERM_PX(cur_x + 1) - 1, TERM_PY(cur_y + 1) - 1);
+        term_rp->Mask = mask;
+        SetDrMd(term_rp, JAM2);
+        blit_pending = 1;
+        return;
+    }
     term_blit_sync();
     for (p = 0; p < 4; p++) {
         UBYTE *dst = term_plane[p] + off;
@@ -241,23 +357,21 @@ static void cursor_show(void)
 static void term_scroll_up(WORD n)
 {
     WORD bg = term_pen_bg;
-    if (n >= term_rows) {
-        term_rect_fill(0, 0, COLS, term_rows, bg);
+
+    /* The line feed at the bottom: the most frequent scroll, kept short. */
+    if (!term_rp && n < term_rows) {
+        BltBitMap(term_bm, term_x0, term_y0 + (n << 3), term_bm, term_x0, term_y0,
+                  COLS << 3, (term_rows - n) << 3, 0xC0, 0xF, NULL);
+        blit_pending = 1;
+        term_rect_fill(0, term_rows - n, COLS, n, bg);
         return;
     }
-    term_rect_copy(0, n, 0, 0, COLS, term_rows - n);
-    term_rect_fill(0, term_rows - n, COLS, n, bg);
+    term_rect_scroll(0, 0, COLS, term_rows, 0, -n, bg);
 }
 
 static void term_scroll_down(WORD n)
 {
-    WORD bg = term_pen_bg;
-    if (n >= term_rows) {
-        term_rect_fill(0, 0, COLS, term_rows, bg);
-        return;
-    }
-    term_rect_copy(0, 0, 0, n, COLS, term_rows - n);
-    term_rect_fill(0, 0, COLS, n, bg);
+    term_rect_scroll(0, 0, COLS, term_rows, 0, n, term_pen_bg);
 }
 
 static void term_erase_display(WORD mode)
@@ -291,38 +405,22 @@ static void term_erase_line(WORD mode)
 
 static void term_insert_lines(WORD n)
 {
-    WORD below = term_rows - cur_y;
-    if (n > below)
-        n = below;
-    term_rect_copy(0, cur_y, 0, cur_y + n, COLS, below - n);
-    term_rect_fill(0, cur_y, COLS, n, term_pen_bg);
+    term_rect_scroll(0, cur_y, COLS, term_rows - cur_y, 0, n, term_pen_bg);
 }
 
 static void term_delete_lines(WORD n)
 {
-    WORD below = term_rows - cur_y;
-    if (n > below)
-        n = below;
-    term_rect_copy(0, cur_y + n, 0, cur_y, COLS, below - n);
-    term_rect_fill(0, term_rows - n, COLS, n, term_pen_bg);
+    term_rect_scroll(0, cur_y, COLS, term_rows - cur_y, 0, -n, term_pen_bg);
 }
 
 static void term_insert_chars(WORD n)
 {
-    WORD rest = COLS - cur_x;
-    if (n > rest)
-        n = rest;
-    term_rect_copy(cur_x, cur_y, cur_x + n, cur_y, rest - n, 1);
-    term_rect_fill(cur_x, cur_y, n, 1, term_pen_bg);
+    term_rect_scroll(cur_x, cur_y, COLS - cur_x, 1, n, 0, term_pen_bg);
 }
 
 static void term_delete_chars(WORD n)
 {
-    WORD rest = COLS - cur_x;
-    if (n > rest)
-        n = rest;
-    term_rect_copy(cur_x + n, cur_y, cur_x, cur_y, rest - n, 1);
-    term_rect_fill(COLS - n, cur_y, n, 1, term_pen_bg);
+    term_rect_scroll(cur_x, cur_y, COLS - cur_x, 1, -n, 0, term_pen_bg);
 }
 
 /* https://syncterm.net/cterm.html#_csi_ps_m_select_graphic_rendition_sgr */
@@ -767,15 +865,49 @@ static void term_reset(void)
     term_rect_fill(0, 0, COLS, term_rows, 0);
 }
 
-/* The caller must open both the Screen and the TextFont before calling
- * term_init(). This function uses these resources to extract glyphs from
- * the supplied font and to initialize the terminal renderer using the
- * screen's BitMap. */
-static int term_init(struct Screen *screen, struct TextFont *tf)
+/* Draw what waits (the RastPort path collects glyphs into runs). Call it
+ * after a batch of term_feed(). */
+static void term_flush(void)
+{
+    if (term_rp)
+        term_run_flush();
+}
+
+/* Something lies over the terminal (another window, an open menu): draw
+ * through the RastPort until it is gone. Only switches when it can:
+ * without a window RastPort there is only the direct way, and a bitmap
+ * the engine cannot draw into directly always takes the RastPort. */
+static void term_covered(WORD covered)
+{
+    struct RastPort *want = (covered || !term_direct_ok) ? term_win_rp : NULL;
+
+    if (want == term_rp)
+        return;
+    term_flush();
+    term_rp = want;
+    blit_pending = 1;       /* the RastPort's blits may still run */
+}
+
+/* The pens the 16 ANSI colours are on, for the RastPort path (a planar
+ * screen of the engine's own has them on pens 0-15, the default). */
+static void term_set_pens(const UBYTE *pens)
+{
+    WORD i;
+    for (i = 0; i < 16; i++)
+        term_pen_map[i] = pens ? pens[i] : (UBYTE)i;
+}
+
+/* The terminal in the rectangle x0, y0, w x h of screen's bitmap, 80
+ * columns of 8x8 cells in font tf. rp is the RastPort of the window it
+ * lies in, whose (0, 0) is pixel (rpdx, rpdy) of the bitmap, for drawing
+ * while something covers it and on a bitmap that is not planar; NULL:
+ * direct drawing only. 0 when the terminal can be drawn. */
+static int term_init_area(struct Screen *screen, struct RastPort *rp, WORD rpdx, WORD rpdy,
+                          WORD x0, WORD y0, WORD w, WORD h, struct TextFont *tf)
 {
     WORD i;
 
-    if (screen == NULL || tf == NULL)
+    if (screen == NULL || tf == NULL || h < 8)
         return 1;
 
     /* The engine's glyphs */
@@ -784,18 +916,44 @@ static int term_init(struct Screen *screen, struct TextFont *tf)
     /* RastPort.BitMap is the authoritative bitmap on every OS (the
      * embedded Screen.BitMap is a compatibility copy on V39+/AROS). */
     term_bm = screen->RastPort.BitMap;
-    if (term_bm->Depth < 4)
-        return 1;
-    for (i = 0; i < 4; i++) {
+    term_direct_ok = term_bm->Depth >= 4 && (x0 & 7) == 0 && w >= COLS * 8;
+    if (((struct Library *)GfxBase)->lib_Version >= 39
+        && !(GetBitMapAttr(term_bm, BMA_FLAGS) & BMF_STANDARD))
+        term_direct_ok = 0;             /* RTG: not bitplanes */
+    for (i = 0; i < 4 && term_direct_ok; i++) {
         term_plane[i] = term_bm->Planes[i];
         if (!term_plane[i])
-            return 1;
+            term_direct_ok = 0;
     }
+    if (!term_direct_ok && !rp)
+        return 1;
     term_bpr = (WORD)term_bm->BytesPerRow;
     /* Fixed for the life of the screen, so computed once here instead
      * of on every glyph. */
     term_row_stride = (LONG)term_bpr << 3;
-    term_rows = screen->Height >> 3;
+    term_x0 = x0;
+    term_y0 = y0;
+    term_rows = h >> 3;
+    term_win_rp = rp;
+    term_rp_dx = rpdx;
+    term_rp_dy = rpdy;
+    term_baseline = tf->tf_Baseline;
+    term_run_n = 0;
+    if (rp)
+        SetFont(rp, tf);
+    term_set_pens(NULL);
+    term_rp = term_direct_ok ? NULL : rp;
     term_reset();
     return 0;
+}
+
+/* The caller must open both the Screen and the TextFont before calling
+ * term_init(). This function uses these resources to extract glyphs from
+ * the supplied font and to initialize the terminal renderer using the
+ * screen's BitMap, the whole of it, drawn directly. */
+static int term_init(struct Screen *screen, struct TextFont *tf)
+{
+    if (screen == NULL)
+        return 1;
+    return term_init_area(screen, NULL, 0, 0, 0, 0, screen->Width, screen->Height, tf);
 }
