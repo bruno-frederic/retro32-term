@@ -95,7 +95,8 @@ static WORD term_pens_ansi = 1;       /* pens 0-15 are the ANSI colours (direct 
  * The 8-pixel direct path pays one test for both. */
 static WORD term_alt;
 static WORD term_baseline;            /* the font's, for Move() before Text() */
-static UBYTE term_pen_map[16];        /* ANSI colour -> screen pen (RastPort path) */
+static UBYTE term_pen_map[256];       /* colour -> screen pen (RastPort path): 0-15 the ANSI
+                                       * colours, 16-255 for the host's own (term_set_pen) */
 
 /* Glyphs waiting for one Text() call: same row, adjacent, same pens. */
 static UBYTE term_run[COLS];
@@ -202,7 +203,7 @@ static void term_rect_fill(WORD x, WORD y, WORD w, WORD h, WORD pen)
         return;
     if (term_rp) {
         term_run_flush();
-        SetAPen(term_rp, term_pen_map[pen & 0xF]);
+        SetAPen(term_rp, term_pen_map[pen & 0xFF]);
         SetDrMd(term_rp, JAM1);
         RectFill(term_rp, TERM_PX(x), TERM_PY(y), TERM_PX(x + w) - 1, TERM_PY(y + h) - 1);
         blit_pending = 1;
@@ -237,7 +238,7 @@ static void term_rect_scroll(WORD x, WORD y, WORD w, WORD h, WORD dx, WORD dy, W
         /* The uncovered strip is filled below: ScrollRaster() leaves it to a
          * backfill hook, when the window has one, instead of BgPen (V39). */
         term_run_flush();
-        SetBPen(term_rp, term_pen_map[pen & 0xF]);
+        SetBPen(term_rp, term_pen_map[pen & 0xFF]);
         ScrollRaster(term_rp, -dx << term_xs, -dy << 3,
                      TERM_PX(x), TERM_PY(y), TERM_PX(x + w) - 1, TERM_PY(y + h) - 1);
         blit_pending = 1;
@@ -978,6 +979,14 @@ static void term_set_pens(const UBYTE *pens)
         blit_pending = 1;
     }
     term_alt = term_rp || term_xs != 3;
+}
+
+/* The screen pen for colour slot (16-255 are the host's, e.g. pens it
+ * obtained for 24-bit colours). Drawn through the RastPort only; the direct
+ * planar path stays 4-bit. */
+static void term_set_pen(UBYTE slot, UBYTE pen)
+{
+    term_pen_map[slot] = pen;
 }
 
 /* Another font of the same cell width (the C64's upper-case/graphics and
