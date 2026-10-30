@@ -283,9 +283,8 @@ static void term_sync_row_base(void)
 
 /* The glyph at column x of the current row, in a 16-pixel cell (two bytes
  * per plane row). */
-static void term_glyph_wide(WORD x, UBYTE ch)
+static void term_glyph_wide_rows(WORD x, const UWORD *g)
 {
-    const UWORD *g = &font16[(UWORD)ch << 3];
     LONG off = term_row_base + (x << 1);
     UBYTE fg = term_pen_fg, bg = term_pen_bg;
     WORD p, r;
@@ -305,6 +304,11 @@ static void term_glyph_wide(WORD x, UBYTE ch)
             dst[0] = dst[1] = f ? 0xFF : 0x00;
         }
     }
+}
+
+static void term_glyph_wide(WORD x, UBYTE ch)
+{
+    term_glyph_wide_rows(x, &font16[(UWORD)ch << 3]);
 }
 
 /* Draws the glyph at column x, on the current row.
@@ -373,6 +377,76 @@ static void term_glyph(WORD x, UBYTE ch)
         }
         if (atr_under)
             *(dst - bpr) = f ? 0xFF : 0x00;
+    }
+}
+
+/* The cell at column x of the current row from 8 bitmap rows instead of a
+ * font character (box and block glyphs the font lacks): rows are left-aligned,
+ * bit 15 the leftmost pixel, a set bit the foreground; the cell is 8 or 16
+ * pixels wide as the font is. Pens and underline as term_glyph(). The direct
+ * 8-pixel loop is term_glyph()'s again, not a shared call: term_glyph() is the
+ * hot path and stays as it is. */
+static void term_glyph_bits(WORD x, const UWORD *rows)
+{
+    UBYTE fg = term_pen_fg, bg = term_pen_bg;
+    WORD p, r;
+
+    if (term_alt) {
+        if (!term_rp) {
+            term_glyph_wide_rows(x, rows);
+            return;
+        }
+        /* RastPort path: the cell in the background pen, the set pixels of
+         * each row in the foreground pen, one RectFill per run of them */
+        {
+            WORD px, py, w = 1 << term_xs;
+
+            term_run_flush();       /* keeps the order of the glyphs */
+            px = TERM_PX(x);
+            py = TERM_PY(cur_y);
+            SetDrMd(term_rp, JAM1);
+            SetAPen(term_rp, term_pen_map[bg]);
+            RectFill(term_rp, px, py, px + w - 1, py + 7);
+            SetAPen(term_rp, term_pen_map[fg]);
+            for (r = 0; r < 8; r++) {
+                WORD c = 0;
+                while (c < w) {
+                    WORD c0;
+                    if (!(rows[r] & (0x8000U >> c))) {
+                        c++;
+                        continue;
+                    }
+                    c0 = c;
+                    while (c < w && (rows[r] & (0x8000U >> c)))
+                        c++;
+                    RectFill(term_rp, px + c0, py + r, px + c - 1, py + r);
+                }
+            }
+            if (atr_under)
+                RectFill(term_rp, px, py + 7, px + w - 1, py + 7);
+            blit_pending = 1;
+        }
+        return;
+    }
+    {
+        LONG off = term_row_base + x;
+        WORD bpr = term_bpr;
+        UBYTE **plane = term_plane;
+
+        term_blit_sync();
+        for (p = 0; p < 4; p++) {
+            UBYTE f = (UBYTE)((fg >> p) & 1);
+            UBYTE b = (UBYTE)((bg >> p) & 1);
+            UBYTE *dst = *plane++ + off;
+
+            for (r = 0; r < 8; r++) {
+                UBYTE g = (UBYTE)(rows[r] >> 8);
+                *dst = f == b ? (f ? 0xFF : 0x00) : f ? g : (UBYTE)~g;
+                dst += bpr;
+            }
+            if (atr_under)
+                *(dst - bpr) = f ? 0xFF : 0x00;
+        }
     }
 }
 
