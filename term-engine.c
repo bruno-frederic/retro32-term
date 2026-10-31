@@ -76,7 +76,15 @@ static WORD atr_bold, atr_blink, atr_inv, atr_under;
 static UBYTE term_pen_fg = 7, term_pen_bg; /* Cached resolved pens */
 static WORD wrap_pending;
 static WORD cursor_visible = 1; /* ESC[?25l/h */
-static WORD cursor_drawn;       /* cursor cell is currently inverted */
+static WORD cursor_drawn;       /* the cursor block is currently drawn */
+/* The host's cell source: redraws the cell at column x, row y from the host's
+ * own grid through term_glyph()/term_glyph_bits(). The engine keeps no cell
+ * buffer; with a source set the cursor is drawn and removed by redrawing its
+ * cell (term_cursor_paint set: pens from term_cursor_pens()). Without one
+ * (the standalone terminal) the cursor falls back to inverting the planes. */
+static void (*term_cell_source)(WORD x, WORD y);
+static WORD term_cursor_paint;  /* the host draws the cell as the cursor block */
+static WORD term_cursor_busy;   /* the cell is drawn for the cursor (block on or off), not for the text */
 static WORD blit_pending;       /* a BltBitMap has been started */
 
 /* The terminal's place in the screen bitmap: top-left pixel (term_x0 a
@@ -450,10 +458,9 @@ static void term_glyph_bits(WORD x, const UWORD *rows)
     }
 }
 
-/* The cursor is the cell under it with every plane byte inverted (pen
- * XOR 15), which is self-restoring: flipping twice puts the cell back.
- * Drawing only ever happens with the cursor hidden (see drain_serial),
- * so glyphs never land on an inverted cell. */
+/* Standalone terminal, no cell source: the cursor is the cell under it
+ * with every plane byte inverted (pen XOR 15), which is self-restoring:
+ * flipping twice puts the cell back. */
 static void term_cursor_flip(void)
 {
     LONG off = term_row_base + cur_x;
@@ -484,10 +491,43 @@ static void term_cursor_flip(void)
     }
 }
 
+/* The cursor's pens for a cell whose background pen is bg: a solid block in
+ * ANSI bright white (pen 15) with the character in the cell's background
+ * pen; on a white or bright white background (7, 15) the block is black
+ * (pen 0), so it stays visible. Only ANSI pens, so no extra pens at any
+ * depth. */
+static void term_cursor_pens(UBYTE bg, UBYTE *block, UBYTE *text)
+{
+    *block = (bg == 7 || bg == 15) ? 0 : 15;
+    *text = bg;
+}
+
+/* Draw (on) or remove (!on) the cursor block at (cur_x, cur_y) by redrawing
+ * that cell from the host's grid. Drawing only ever happens with the cursor
+ * hidden (see drain_serial), so glyphs never land on the block. */
+static void term_cursor_draw(WORD on)
+{
+    WORD sy = cur_y;
+
+    if (!term_cell_source) {
+        term_cursor_flip();
+        return;
+    }
+    term_cursor_busy = 1;
+    term_cursor_paint = on;
+    term_cell_source(cur_x, cur_y);
+    term_cursor_paint = 0;
+    term_cursor_busy = 0;
+    cur_y = sy;                 /* the source moves cur_y to the row it draws */
+    term_sync_row_base();
+    if (term_rp)
+        term_run_flush();
+}
+
 static void cursor_hide(void)
 {
     if (cursor_drawn) {
-        term_cursor_flip();
+        term_cursor_draw(0);
         cursor_drawn = 0;
     }
 }
@@ -495,7 +535,7 @@ static void cursor_hide(void)
 static void cursor_show(void)
 {
     if (cursor_visible && !cursor_drawn) {
-        term_cursor_flip();
+        term_cursor_draw(1);
         cursor_drawn = 1;
     }
 }
